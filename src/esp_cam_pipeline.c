@@ -25,10 +25,20 @@ static const char *TAG = "cam_pipeline";
  * Buffer allocation with SPIRAM preferred, internal RAM fallback.
  */
 static uint8_t *allocate_buffer(size_t size) {
+#if SOC_PPA_SUPPORTED
+    /* PPA DMA requires cache-line-aligned buffers */
+    uint8_t *buf = heap_caps_aligned_alloc(128, size,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = heap_caps_aligned_alloc(128, size,
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+#else
     uint8_t *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) {
         buf = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
+#endif
     return buf;
 }
 
@@ -157,36 +167,53 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
         return;
     }
 
-    // Crop camera frame into back buffer
-    horizontal_crop(camera_buf, back, camera_width, camera_height,
-                    p->display_width, p->display_height);
-
-    // PPA counter-rotate if available (P4 only)
-    uint8_t *display_src = back;
+    // Transform camera frame into back buffer
 #if SOC_PPA_SUPPORTED
-    if (p->ppa_client && p->ppa_buffer && !p->closing) {
+    if (p->ppa_client && !p->closing) {
+        /* Uniform fill: scale to cover the display, center-crop the excess */
+        float sx = (float)p->display_width / camera_width;
+        float sy = (float)p->display_height / camera_height;
+        float scale = (sx > sy) ? sx : sy;
+
+        uint32_t in_w = (uint32_t)(p->display_width / scale);
+        uint32_t in_h = (uint32_t)(p->display_height / scale);
+        uint32_t off_x = (camera_width - in_w) / 2;
+        uint32_t off_y = (camera_height - in_h) / 2;
+
         ppa_srm_oper_config_t srm = {
-            .in.buffer = back,
-            .in.pic_w = p->display_width,
-            .in.pic_h = p->display_height,
-            .in.block_w = p->display_width,
-            .in.block_h = p->display_height,
+            .in.buffer = camera_buf,
+            .in.pic_w = camera_width,
+            .in.pic_h = camera_height,
+            .in.block_w = in_w,
+            .in.block_h = in_h,
+            .in.block_offset_x = off_x,
+            .in.block_offset_y = off_y,
             .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-            .out.buffer = p->ppa_buffer,
-            .out.buffer_size = p->ppa_buffer_size,
+            .out.buffer = back,
+            .out.buffer_size = p->buffer_size,
             .out.pic_w = p->display_width,
             .out.pic_h = p->display_height,
+            .out.block_offset_x = 0,
+            .out.block_offset_y = 0,
             .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
             .rotation_angle = p->ppa_angle,
-            .scale_x = 1.0,
-            .scale_y = 1.0,
+            .scale_x = scale,
+            .scale_y = scale,
             .mode = PPA_TRANS_MODE_BLOCKING,
         };
-        if (ppa_do_scale_rotate_mirror(p->ppa_client, &srm) == ESP_OK) {
-            display_src = p->ppa_buffer;
+        if (ppa_do_scale_rotate_mirror(p->ppa_client, &srm) != ESP_OK) {
+            horizontal_crop(camera_buf, back, camera_width, camera_height,
+                            p->display_width, p->display_height);
         }
+    } else {
+        horizontal_crop(camera_buf, back, camera_width, camera_height,
+                        p->display_width, p->display_height);
     }
+#else
+    horizontal_crop(camera_buf, back, camera_width, camera_height,
+                    p->display_width, p->display_height);
 #endif
+    uint8_t *display_src = back;
 
     // Push to display (non-blocking — skip if display is busy)
     if (!p->closing && !p->destruction_in_progress && p->display_handle) {
@@ -313,6 +340,18 @@ cam_pipeline_create(const cam_pipeline_config_t *config) {
         goto error;
     }
 
+#if SOC_PPA_SUPPORTED
+    {
+        ppa_client_config_t ppa_cfg = {
+            .oper_type = PPA_OPERATION_SRM,
+        };
+        if (ppa_register_client(&ppa_cfg, &p->ppa_client) != ESP_OK) {
+            ESP_LOGW(TAG, "PPA registration failed, falling back to software crop");
+            p->ppa_client = NULL;
+        }
+    }
+#endif
+
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
     p->last_log_time = esp_timer_get_time();
 #endif
@@ -398,10 +437,6 @@ void cam_pipeline_destroy(cam_pipeline_handle_t handle) {
     if (p->ppa_client) {
         ppa_unregister_client(p->ppa_client);
         p->ppa_client = NULL;
-    }
-    if (p->ppa_buffer) {
-        free(p->ppa_buffer);
-        p->ppa_buffer = NULL;
     }
 #endif
 

@@ -48,11 +48,9 @@ struct cam_pipeline {
     volatile bool is_initialized;
     volatile int active_frame_operations;
 
-    // PPA rotation (P4 only)
+    // PPA crop + scale + rotate (P4 only)
 #if SOC_PPA_SUPPORTED
     ppa_client_handle_t ppa_client;
-    uint8_t *ppa_buffer;
-    size_t ppa_buffer_size;
     ppa_srm_rotation_angle_t ppa_angle;
 #endif
 
