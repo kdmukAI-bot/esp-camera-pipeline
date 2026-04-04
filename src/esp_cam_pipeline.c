@@ -2,7 +2,7 @@
  * ESP Camera Pipeline — Core Engine
  *
  * Triple-buffered camera → display → consumer pipeline.
- * Extracted and evolved from Kern main/qr/scanner.c.
+ * Extracted and evolved from Kern.
  *
  * Three independent frame rates:
  *   Camera  — sensor native rate (the only hard clock)
@@ -13,7 +13,6 @@
  */
 
 #include "esp_cam_pipeline_internal.h"
-#include "qr_decode.h"
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -61,8 +60,7 @@ static void horizontal_crop(const uint8_t *camera_buf, uint8_t *display_buf,
 }
 
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
-/* Non-static: called from qr_decode.c decode task for periodic logging */
-void log_debug_metrics(struct cam_pipeline *p) {
+static void log_debug_metrics(struct cam_pipeline *p) {
     int64_t now = esp_timer_get_time();
     int64_t elapsed_us = now - p->last_log_time;
 
@@ -89,32 +87,11 @@ void log_debug_metrics(struct cam_pipeline *p) {
             (p->consumer_hold_time_us / p->consumer_frames) / 1000.0f;
     }
 
-    if (p->on_qr_decoded) {
-        float avg_gray_ms = 0;
-        float avg_quirc_ms = 0;
-        float detections_per_sec = p->qr_detections / elapsed_sec;
-
-        if (p->consumer_frames > 0) {
-            avg_gray_ms =
-                (p->grayscale_time_us / p->consumer_frames) / 1000.0f;
-            avg_quirc_ms =
-                (p->quirc_time_us / p->consumer_frames) / 1000.0f;
-        }
-
-        ESP_LOGI(TAG,
-                 "cam=%.1ffps disp=%.1ffps(skip %.0f%%) "
-                 "decode=%.1ffps(gray=%.1fms quirc=%.1fms) "
-                 "det/s=%.1f lock_wait=%.1fms hold=%.1fms",
-                 camera_fps, display_fps, display_skip_pct, consumer_fps,
-                 avg_gray_ms, avg_quirc_ms, detections_per_sec,
-                 avg_lock_wait_ms, avg_hold_time_ms);
-    } else {
-        ESP_LOGI(TAG,
-                 "cam=%.1ffps disp=%.1ffps(skip %.0f%%) "
-                 "consumer=%.1ffps lock_wait=%.1fms hold=%.1fms",
-                 camera_fps, display_fps, display_skip_pct, consumer_fps,
-                 avg_lock_wait_ms, avg_hold_time_ms);
-    }
+    ESP_LOGI(TAG,
+             "cam=%.1ffps disp=%.1ffps(skip %.0f%%) "
+             "consumer=%.1ffps lock_wait=%.1fms hold=%.1fms",
+             camera_fps, display_fps, display_skip_pct, consumer_fps,
+             avg_lock_wait_ms, avg_hold_time_ms);
 
     // Reset counters
     p->camera_frames = 0;
@@ -123,9 +100,6 @@ void log_debug_metrics(struct cam_pipeline *p) {
     p->consumer_frames = 0;
     p->consumer_lock_wait_us = 0;
     p->consumer_hold_time_us = 0;
-    p->grayscale_time_us = 0;
-    p->quirc_time_us = 0;
-    p->qr_detections = 0;
     p->last_log_time = now;
 }
 #endif
@@ -160,6 +134,7 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
 
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
     __atomic_add_fetch(&p->camera_frames, 1, __ATOMIC_RELAXED);
+    log_debug_metrics(p);
 #endif
 
     // Select back buffer: whichever of the 3 is neither front nor locked
@@ -295,8 +270,6 @@ cam_pipeline_create(const cam_pipeline_config_t *config) {
     p->display_height = config->display_height;
     p->camera_driver = config->camera_driver;
     p->display_driver = config->display_driver;
-    p->on_qr_decoded = config->on_qr_decoded;
-    p->user_ctx = config->user_ctx;
 
     // Allocate three frame buffers (RGB565: width * height * 2 bytes each)
     p->buffer_size = config->display_width * config->display_height * 2;
@@ -340,14 +313,6 @@ cam_pipeline_create(const cam_pipeline_config_t *config) {
         goto error;
     }
 
-    // QR decode mode: set up decoder resources before starting camera
-    if (config->on_qr_decoded) {
-        if (!qr_decode_init(p)) {
-            ESP_LOGE(TAG, "QR decode init failed");
-            goto error;
-        }
-    }
-
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
     p->last_log_time = esp_timer_get_time();
 #endif
@@ -364,9 +329,8 @@ cam_pipeline_create(const cam_pipeline_config_t *config) {
         goto error;
     }
 
-    ESP_LOGI(TAG, "Pipeline created: %" PRIu32 "x%" PRIu32 " %s mode",
-             config->display_width, config->display_height,
-             config->on_qr_decoded ? "QR decode" : "preview-only");
+    ESP_LOGI(TAG, "Pipeline created: %" PRIu32 "x%" PRIu32,
+             config->display_width, config->display_height);
 
     return p;
 
@@ -410,11 +374,6 @@ void cam_pipeline_destroy(cam_pipeline_handle_t handle) {
         p->camera_driver->stop(p->camera_handle);
         p->camera_driver->deinit(p->camera_handle);
         p->camera_handle = NULL;
-    }
-
-    // Clean up QR decode resources
-    if (p->on_qr_decoded) {
-        qr_decode_cleanup(p);
     }
 
     // Clean up display
@@ -557,18 +516,6 @@ esp_err_t cam_pipeline_get_debug_stats(cam_pipeline_handle_t handle,
     } else {
         stats->avg_consumer_lock_wait_ms = 0;
         stats->avg_consumer_hold_time_ms = 0;
-    }
-
-    if (handle->on_qr_decoded && handle->consumer_frames > 0) {
-        stats->avg_grayscale_ms =
-            (handle->grayscale_time_us / handle->consumer_frames) / 1000.0f;
-        stats->avg_quirc_ms =
-            (handle->quirc_time_us / handle->consumer_frames) / 1000.0f;
-        stats->qr_detections_per_sec = handle->qr_detections / elapsed_sec;
-    } else {
-        stats->avg_grayscale_ms = 0;
-        stats->avg_quirc_ms = 0;
-        stats->qr_detections_per_sec = 0;
     }
 
     return ESP_OK;

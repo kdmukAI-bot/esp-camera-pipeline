@@ -1,11 +1,9 @@
 idf_component_register(
     SRCS
         "src/esp_cam_pipeline.c"
-        "src/rgb565_lut.c"
-        "src/qr_decode.c"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "src"
-    REQUIRES k_quirc freertos esp_timer
+    REQUIRES freertos esp_timer
     PRIV_REQUIRES esp_hw_support
 )
 

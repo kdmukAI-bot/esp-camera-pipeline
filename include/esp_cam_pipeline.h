@@ -12,20 +12,10 @@
 #include "cam_pipeline_camera_driver.h"
 #include "cam_pipeline_display_driver.h"
 #include <esp_err.h>
-#include <k_quirc.h>
 #include <stdbool.h>
 #include <stdint.h>
 
 typedef struct cam_pipeline *cam_pipeline_handle_t;
-
-/**
- * Called from decode task for each successfully decoded QR code.
- * payload/len is the raw decoded data. metadata has version, ECC, data type.
- * Must return quickly — runs in decode task context.
- */
-typedef void (*cam_pipeline_qr_cb_t)(const uint8_t *payload, size_t len,
-                                     const k_quirc_data_t *metadata,
-                                     void *user_ctx);
 
 typedef struct {
     uint32_t display_width;  // Cropped frame width for display + consumers
@@ -37,16 +27,11 @@ typedef struct {
     const cam_pipeline_display_driver_t *display_driver;
     const void *display_config; // Opaque, passed to display_driver->init()
     void *display_parent;       // e.g. lv_obj_t* for LVGL, NULL for raw
-
-    // Built-in QR decode consumer (optional)
-    cam_pipeline_qr_cb_t on_qr_decoded; // NULL = no QR decoding (preview-only)
-    void *user_ctx;                     // Passed to QR callback
 } cam_pipeline_config_t;
 
 /**
- * Allocate all resources (triple buffer, display surface, camera hardware),
- * begin streaming. If on_qr_decoded is non-NULL, also creates QR decode
- * task + k_quirc + grayscale LUT.
+ * Allocate all resources (triple buffer, display surface, camera hardware)
+ * and begin streaming.
  * Returns handle on success, NULL on failure.
  */
 cam_pipeline_handle_t
@@ -121,9 +106,6 @@ typedef struct {
     float consumer_fps;
     float avg_consumer_lock_wait_ms;
     float avg_consumer_hold_time_ms;
-    float avg_grayscale_ms;      // 0 if preview-only mode
-    float avg_quirc_ms;          // 0 if preview-only mode
-    float qr_detections_per_sec; // 0 if preview-only mode
 } cam_pipeline_debug_stats_t;
 
 /**

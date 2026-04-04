@@ -1,0 +1,23 @@
+menu "Camera Pipeline QR Consumer"
+
+    config CAM_PIPELINE_QR_TASK_STACK_SIZE
+        int "QR decode task stack size"
+        default 32768
+
+    config CAM_PIPELINE_QR_TASK_PRIORITY
+        int "QR decode task priority"
+        default 5
+
+    config CAM_PIPELINE_QR_DEBUG
+        bool "Enable QR consumer performance metrics"
+        default n
+        help
+            Enables QR decode timing metrics (grayscale conversion,
+            quirc detection, decode rate). Logged at the configured interval.
+
+    config CAM_PIPELINE_QR_DEBUG_LOG_INTERVAL_MS
+        int "QR debug metrics log interval (ms)"
+        default 2000
+        depends on CAM_PIPELINE_QR_DEBUG
+
+endmenu
