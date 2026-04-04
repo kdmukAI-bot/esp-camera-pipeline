@@ -64,12 +64,51 @@ static void rgb565_to_grayscale(const uint8_t *rgb565_data, uint8_t *gray_data,
     }
 }
 
+/**
+ * Convert a centered square crop of an RGB565 frame to grayscale.
+ * Only processes the crop region, writing crop_size * crop_size pixels.
+ */
+static void rgb565_to_grayscale_cropped(const uint8_t *rgb565_data,
+                                        uint8_t *gray_data,
+                                        uint32_t frame_width,
+                                        uint32_t crop_size,
+                                        uint32_t offset_x,
+                                        uint32_t offset_y,
+                                        const uint8_t *lut) {
+    const uint16_t *pixels = (const uint16_t *)rgb565_data;
+
+    for (uint32_t y = 0; y < crop_size; y++) {
+        const uint16_t *src_row = pixels + (y + offset_y) * frame_width + offset_x;
+        uint8_t *dst_row = gray_data + y * crop_size;
+
+        if (lut) {
+            for (uint32_t x = 0; x < crop_size; x++) {
+                dst_row[x] = lut[src_row[x]];
+            }
+        } else {
+            for (uint32_t x = 0; x < crop_size; x++) {
+                uint16_t pixel = src_row[x];
+                uint8_t r5 = (pixel >> 11) & 0x1F;
+                uint8_t g6 = (pixel >> 5) & 0x3F;
+                uint8_t b5 = pixel & 0x1F;
+                uint8_t r8 = (r5 * 255 + 15) / 31;
+                uint8_t g8 = (g6 * 255 + 31) / 63;
+                uint8_t b8 = (b5 * 255 + 15) / 31;
+                dst_row[x] = (uint8_t)((77 * r8 + 150 * g8 + 29 * b8) >> 8);
+            }
+        }
+    }
+}
+
 /* --- Internal state --- */
 
 struct cam_pipeline_qr {
     cam_pipeline_handle_t pipeline;
     uint32_t frame_width;
     uint32_t frame_height;
+    uint32_t crop_size;      /* square crop dimension (min of w, h) */
+    uint32_t crop_offset_x;  /* horizontal offset to center crop */
+    uint32_t crop_offset_y;  /* vertical offset to center crop */
     cam_pipeline_qr_cb_t on_decoded;
     void *user_ctx;
 
@@ -151,9 +190,12 @@ static void qr_decode_task(void *pvParameters) {
 #ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
             gray_start = esp_timer_get_time();
 #endif
-            rgb565_to_grayscale(frame, qr_buf,
-                                qr->frame_width, qr->frame_height,
-                                qr->rgb565_gray_lut);
+            rgb565_to_grayscale_cropped(frame, qr_buf,
+                                       qr->frame_width,
+                                       qr->crop_size,
+                                       qr->crop_offset_x,
+                                       qr->crop_offset_y,
+                                       qr->rgb565_gray_lut);
 #ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
             gray_end = esp_timer_get_time();
             quirc_start = esp_timer_get_time();
@@ -223,6 +265,13 @@ cam_pipeline_qr_create(const cam_pipeline_qr_config_t *config) {
     qr->on_decoded = config->on_decoded;
     qr->user_ctx = config->user_ctx;
 
+    /* Compute centered square crop (use shorter dimension) */
+    uint32_t w = config->frame_width;
+    uint32_t h = config->frame_height;
+    qr->crop_size = (w < h) ? w : h;
+    qr->crop_offset_x = (w - qr->crop_size) / 2;
+    qr->crop_offset_y = (h - qr->crop_size) / 2;
+
     // Build RGB565->grayscale LUT (64KB, SPIRAM)
     qr->rgb565_gray_lut = rgb565_lut_build();
     // Non-fatal if LUT fails -- rgb565_to_grayscale falls back to per-pixel
@@ -233,8 +282,8 @@ cam_pipeline_qr_create(const cam_pipeline_qr_config_t *config) {
         goto error;
     }
 
-    if (k_quirc_resize(qr->qr_decoder, config->frame_width,
-                       config->frame_height) < 0) {
+    if (k_quirc_resize(qr->qr_decoder, qr->crop_size,
+                       qr->crop_size) < 0) {
         ESP_LOGE(TAG, "Failed to resize QR decoder");
         goto error;
     }
@@ -260,8 +309,11 @@ cam_pipeline_qr_create(const cam_pipeline_qr_config_t *config) {
         goto error;
     }
 
-    ESP_LOGI(TAG, "QR consumer created: %" PRIu32 "x%" PRIu32,
-             config->frame_width, config->frame_height);
+    ESP_LOGI(TAG, "QR consumer created: %" PRIu32 "x%" PRIu32
+             " (crop %" PRIu32 "x%" PRIu32 " at +%" PRIu32 ",+%" PRIu32 ")",
+             config->frame_width, config->frame_height,
+             qr->crop_size, qr->crop_size,
+             qr->crop_offset_x, qr->crop_offset_y);
 
     return qr;
 
