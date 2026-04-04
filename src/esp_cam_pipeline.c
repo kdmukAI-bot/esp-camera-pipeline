@@ -17,6 +17,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <inttypes.h>
+#include <math.h>
 #include <string.h>
 
 static const char *TAG = "cam_pipeline";
@@ -168,17 +169,59 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
     }
 
     // Transform camera frame into back buffer
+
 #if SOC_PPA_SUPPORTED
     if (p->ppa_client && !p->closing) {
-        /* Uniform fill: scale to cover the display, center-crop the excess */
-        float sx = (float)p->display_width / camera_width;
-        float sy = (float)p->display_height / camera_height;
+        /* PPA pipeline is crop → scale → rotate.  When rotating 90/270°
+         * the output dimensions swap, so the scale step must target
+         * swapped dimensions to produce display_width × display_height
+         * after rotation. */
+        bool swap = (p->ppa_angle == PPA_SRM_ROTATION_ANGLE_90 ||
+                     p->ppa_angle == PPA_SRM_ROTATION_ANGLE_270);
+        uint32_t target_w = swap ? p->display_height : p->display_width;
+        uint32_t target_h = swap ? p->display_width  : p->display_height;
+
+        /* Uniform fill: scale to cover the target, center-crop the excess */
+        float sx = (float)target_w / camera_width;
+        float sy = (float)target_h / camera_height;
         float scale = (sx > sy) ? sx : sy;
 
-        uint32_t in_w = (uint32_t)(p->display_width / scale);
-        uint32_t in_h = (uint32_t)(p->display_height / scale);
+        /* PPA scale is 4-bit fractional (scale = int + frag/16).
+         * Quantize to the next higher representable scale so the output
+         * is >= target dimensions, then center the oversized result. */
+        float q_scale = ceilf(scale * 16.0f) / 16.0f;
+        uint32_t in_w = (uint32_t)(target_w / q_scale);
+        uint32_t in_h = (uint32_t)(target_h / q_scale);
+        if (in_w > camera_width) in_w = camera_width;
+        if (in_h > camera_height) in_h = camera_height;
         uint32_t off_x = (camera_width - in_w) / 2;
         uint32_t off_y = (camera_height - in_h) / 2;
+
+        /* Pre-rotation output (may be slightly larger than target) */
+        uint32_t out_w = (uint32_t)(in_w * q_scale);
+        uint32_t out_h = (uint32_t)(in_h * q_scale);
+        if (out_w < target_w) out_w = target_w;
+        if (out_h < target_h) out_h = target_h;
+
+        /* Post-rotation centering offset */
+        uint32_t post_w = swap ? out_h : out_w;
+        uint32_t post_h = swap ? out_w : out_h;
+        uint32_t out_off_x = (post_w - p->display_width) / 2;
+        uint32_t out_off_y = (post_h - p->display_height) / 2;
+
+        static bool ppa_logged = false;
+        if (!ppa_logged) {
+            ESP_LOGI(TAG, "PPA: cam=%"PRIu32"x%"PRIu32" rot=%d"
+                     " target=%"PRIu32"x%"PRIu32" -> disp=%"PRIu32"x%"PRIu32
+                     " ideal=%.4f quant=%.4f in=%"PRIu32"x%"PRIu32
+                     " out=%"PRIu32"x%"PRIu32" out_off=%"PRIu32",%"PRIu32,
+                     camera_width, camera_height, p->ppa_angle * 90,
+                     target_w, target_h,
+                     p->display_width, p->display_height,
+                     scale, q_scale, in_w, in_h, out_w, out_h,
+                     out_off_x, out_off_y);
+            ppa_logged = true;
+        }
 
         ppa_srm_oper_config_t srm = {
             .in.buffer = camera_buf,
@@ -197,8 +240,8 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
             .out.block_offset_y = 0,
             .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
             .rotation_angle = p->ppa_angle,
-            .scale_x = scale,
-            .scale_y = scale,
+            .scale_x = q_scale,
+            .scale_y = q_scale,
             .mode = PPA_TRANS_MODE_BLOCKING,
         };
         if (ppa_do_scale_rotate_mirror(p->ppa_client, &srm) != ESP_OK) {
@@ -348,6 +391,12 @@ cam_pipeline_create(const cam_pipeline_config_t *config) {
         if (ppa_register_client(&ppa_cfg, &p->ppa_client) != ESP_OK) {
             ESP_LOGW(TAG, "PPA registration failed, falling back to software crop");
             p->ppa_client = NULL;
+        }
+        switch (config->rotation) {
+        case 90:  p->ppa_angle = PPA_SRM_ROTATION_ANGLE_90;  break;
+        case 180: p->ppa_angle = PPA_SRM_ROTATION_ANGLE_180; break;
+        case 270: p->ppa_angle = PPA_SRM_ROTATION_ANGLE_270; break;
+        default:  p->ppa_angle = PPA_SRM_ROTATION_ANGLE_0;   break;
         }
     }
 #endif

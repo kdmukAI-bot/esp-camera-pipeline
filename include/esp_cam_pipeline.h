@@ -20,6 +20,7 @@ typedef struct cam_pipeline *cam_pipeline_handle_t;
 typedef struct {
     uint32_t display_width;  // Cropped frame width for display + consumers
     uint32_t display_height; // Cropped frame height for display + consumers
+    uint32_t rotation;       // PPA rotation in degrees: 0, 90, 180, 270 (P4 only)
 
     const cam_pipeline_camera_driver_t *camera_driver;
     const void *camera_config; // Opaque, passed to camera_driver->init()
