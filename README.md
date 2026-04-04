@@ -13,7 +13,7 @@ ESP Camera Pipeline handles the core plumbing of camera capture, live display pr
 - **Pre-allocated buffers** at create time; zero allocations in the hot loop
 - **LVGL overlay support** -- apps can parent custom widgets on top of the live video feed
 - **Per-stage debug metrics** (camera FPS, display FPS/skip rate, consumer FPS/timing) via Kconfig
-- **Multi-target** -- currently supports ESP32-S3 and ESP32-P4 (with PPA hardware rotation), extensible to future ESP32 variants
+- **Multi-target** -- currently supports ESP32-S3 and ESP32-P4 (with PPA hardware crop+scale+rotate), extensible to future ESP32 variants
 
 The pipeline is a pure C ESP-IDF component usable from any ESP32 application -- whether native C/C++ or MicroPython.
 
@@ -164,13 +164,13 @@ Frame consumers (QR decoding, entropy hashing) are implemented in C and use the 
 
 ### cam_pipeline_qr
 
-A reference frame consumer that decodes QR codes from pipeline frames. Located in `components/cam_pipeline_qr/`, it demonstrates the same pattern any external consumer would use: create a task, call `cam_pipeline_lock_frame()`/`release_frame()`, process the frame, repeat.
+A reference frame consumer that decodes QR codes from pipeline frames. Located in `components/cam_pipeline_qr/`, it demonstrates the same pattern any external consumer would use: create a task, call `cam_pipeline_lock_frame()`/`release_frame()`, process the frame, repeat. Automatically center-crops non-square frames to a square region before passing to the QR decoder.
 
 Uses k_quirc for QR detection and decoding. See [cam_pipeline_qr.h](components/cam_pipeline_qr/include/cam_pipeline_qr.h) for the API.
 
 ### k_quirc
 
-QR detection and decoding library, evolved from Espressif's quirc component (`espressif_quirc`) through ~15 commits of significant changes: adaptive/bilinear thresholding, 15%+ performance optimizations, ESP32 memory safeguards (heap-allocated flood-fill stack, SPIRAM-preferred allocations), version cap reduction, and debug visualization.
+QR detection and decoding library, evolved from Espressif's quirc component (`espressif_quirc`) through ~15 commits of significant changes: adaptive/bilinear thresholding, contrast stretch preprocessing for low-light conditions, 15%+ performance optimizations, ESP32 memory safeguards (heap-allocated flood-fill stack, SPIRAM-preferred allocations), version cap reduction, and debug visualization.
 
 Currently vendored in `components/k_quirc/`; will eventually move to its own repo as a git submodule.
 
