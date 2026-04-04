@@ -306,6 +306,73 @@ static uint8_t otsu_threshold(uint32_t *histogram, uint32_t total) {
   return threshold;
 }
 
+/*
+ * Contrast stretch with percentile clipping.
+ *
+ * Remaps the image buffer so that the clip_pct percentile maps to 0 and the
+ * (100-clip_pct) percentile maps to 255. Widens the effective contrast for
+ * Otsu thresholding under low-light or low-contrast conditions.
+ *
+ * Builds a histogram over the full image (one pass), computes clip points,
+ * then remaps via a 256-byte LUT (one pass). Total cost: two passes.
+ */
+#ifdef K_QUIRC_CONTRAST_STRETCH
+
+#ifndef K_QUIRC_CONTRAST_CLIP_PCT
+#define K_QUIRC_CONTRAST_CLIP_PCT 5
+#endif
+
+static void contrast_stretch(uint8_t *image, int w, int h) {
+  int total = w * h;
+
+  /* Build histogram */
+  uint32_t hist[256] = {0};
+  for (int i = 0; i < total; i++)
+    hist[image[i]]++;
+
+  /* Find percentile clip points */
+  uint32_t clip = (uint32_t)total * K_QUIRC_CONTRAST_CLIP_PCT / 100;
+  uint8_t low = 0, high = 255;
+
+  uint32_t cumulative = 0;
+  for (int i = 0; i < 256; i++) {
+    cumulative += hist[i];
+    if (cumulative > clip) {
+      low = (uint8_t)i;
+      break;
+    }
+  }
+
+  cumulative = 0;
+  for (int i = 255; i >= 0; i--) {
+    cumulative += hist[i];
+    if (cumulative > clip) {
+      high = (uint8_t)i;
+      break;
+    }
+  }
+
+  if (high <= low)
+    return; /* degenerate — skip */
+
+  /* Build remap LUT */
+  uint8_t remap[256];
+  int range = high - low;
+  for (int i = 0; i < 256; i++) {
+    if (i <= low)
+      remap[i] = 0;
+    else if (i >= high)
+      remap[i] = 255;
+    else
+      remap[i] = (uint8_t)(((i - low) * 255) / range);
+  }
+
+  /* Apply */
+  for (int i = 0; i < total; i++)
+    image[i] = remap[image[i]];
+}
+#endif /* K_QUIRC_CONTRAST_STRETCH */
+
 // Percentage of image border to ignore for threshold calculation (0.0 - 0.5)
 // 0.2 = ignore 20% on each edge, leaving 60% central region
 #define K_QUIRC_THRESHOLD_MARGIN 0.2f
@@ -1108,6 +1175,9 @@ static void pixels_setup(struct k_quirc *q) {
 void k_quirc_identify(struct k_quirc *q, bool find_inverted) {
 #ifdef K_QUIRC_ADAPTIVE_THRESHOLD
   processing_inverted = false;
+#endif
+#ifdef K_QUIRC_CONTRAST_STRETCH
+  contrast_stretch(q->image, q->w, q->h);
 #endif
   pixels_setup(q);
   threshold(q, false);

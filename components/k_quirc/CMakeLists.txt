@@ -17,6 +17,12 @@ if(CONFIG_K_QUIRC_BILINEAR_THRESHOLD)
     target_compile_definitions(${COMPONENT_LIB} PUBLIC K_QUIRC_BILINEAR_THRESHOLD)
 endif()
 
+if(CONFIG_K_QUIRC_CONTRAST_STRETCH)
+    target_compile_definitions(${COMPONENT_LIB} PUBLIC K_QUIRC_CONTRAST_STRETCH)
+    target_compile_definitions(${COMPONENT_LIB} PUBLIC
+        K_QUIRC_CONTRAST_CLIP_PCT=${CONFIG_K_QUIRC_CONTRAST_CLIP_PCT})
+endif()
+
 if(CONFIG_K_QUIRC_DEBUG)
     target_compile_definitions(${COMPONENT_LIB} PUBLIC K_QUIRC_DEBUG)
 endif()

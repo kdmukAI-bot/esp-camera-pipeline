@@ -17,6 +17,23 @@ menu "K-Quirc QR Decoder"
         bool "Enable bilinear threshold interpolation"
         default y
 
+    config K_QUIRC_CONTRAST_STRETCH
+        bool "Enable contrast stretch before thresholding"
+        default y
+        help
+            Stretches the grayscale histogram with percentile clipping
+            before Otsu thresholding. Improves detection in low-contrast
+            or dim lighting at a small per-frame cost (one LUT remap pass).
+
+    config K_QUIRC_CONTRAST_CLIP_PCT
+        int "Contrast stretch clip percentage (each tail)"
+        default 5
+        range 1 20
+        depends on K_QUIRC_CONTRAST_STRETCH
+        help
+            Percentage of pixels to clip from each tail of the histogram
+            before stretching. 5 = clip darkest 5% and brightest 5%.
+
     config K_QUIRC_DEBUG
         bool "Enable QR decoder debug visualization"
         default n
