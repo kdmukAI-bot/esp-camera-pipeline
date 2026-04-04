@@ -1,0 +1,24 @@
+menu "K-Quirc QR Decoder"
+
+    config K_QUIRC_MAX_VERSION
+        int "Maximum QR code version (1-40)"
+        default 25
+        range 1 40
+        help
+            Higher versions support larger QR codes but use more memory.
+            Version 25 = 117x117 modules. Version 15 = 77x77 modules.
+            Most Bitcoin/crypto QR codes fit within version 15.
+
+    config K_QUIRC_ADAPTIVE_THRESHOLD
+        bool "Enable adaptive threshold"
+        default y
+
+    config K_QUIRC_BILINEAR_THRESHOLD
+        bool "Enable bilinear threshold interpolation"
+        default y
+
+    config K_QUIRC_DEBUG
+        bool "Enable QR decoder debug visualization"
+        default n
+
+endmenu

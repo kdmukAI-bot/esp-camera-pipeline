@@ -1,0 +1,30 @@
+# ESP-IDF build artifacts
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+
+# CMake artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Object/library/binary artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Project instructions (local, not part of the component)
+CLAUDE.md

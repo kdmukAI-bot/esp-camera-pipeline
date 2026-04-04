@@ -1,0 +1,136 @@
+/*
+ * ESP Camera Pipeline
+ * Triple-buffered camera → display → consumer pipeline engine
+ *
+ * Abstract camera and display driver interfaces allow this engine
+ * to run on different hardware (P4 CSI, S3 DVP, various displays)
+ * without modification.
+ */
+
+#pragma once
+
+#include "cam_pipeline_camera_driver.h"
+#include "cam_pipeline_display_driver.h"
+#include <esp_err.h>
+#include <k_quirc.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef struct cam_pipeline *cam_pipeline_handle_t;
+
+/**
+ * Called from decode task for each successfully decoded QR code.
+ * payload/len is the raw decoded data. metadata has version, ECC, data type.
+ * Must return quickly — runs in decode task context.
+ */
+typedef void (*cam_pipeline_qr_cb_t)(const uint8_t *payload, size_t len,
+                                     const k_quirc_data_t *metadata,
+                                     void *user_ctx);
+
+typedef struct {
+    uint32_t display_width;  // Cropped frame width for display + consumers
+    uint32_t display_height; // Cropped frame height for display + consumers
+
+    const cam_pipeline_camera_driver_t *camera_driver;
+    const void *camera_config; // Opaque, passed to camera_driver->init()
+
+    const cam_pipeline_display_driver_t *display_driver;
+    const void *display_config; // Opaque, passed to display_driver->init()
+    void *display_parent;       // e.g. lv_obj_t* for LVGL, NULL for raw
+
+    // Built-in QR decode consumer (optional)
+    cam_pipeline_qr_cb_t on_qr_decoded; // NULL = no QR decoding (preview-only)
+    void *user_ctx;                     // Passed to QR callback
+} cam_pipeline_config_t;
+
+/**
+ * Allocate all resources (triple buffer, display surface, camera hardware),
+ * begin streaming. If on_qr_decoded is non-NULL, also creates QR decode
+ * task + k_quirc + grayscale LUT.
+ * Returns handle on success, NULL on failure.
+ */
+cam_pipeline_handle_t
+cam_pipeline_create(const cam_pipeline_config_t *config);
+
+/**
+ * Stop streaming, tear down all tasks, free all resources.
+ * Handle is invalid after this call.
+ */
+void cam_pipeline_destroy(cam_pipeline_handle_t handle);
+
+/* --- Frame access for external consumers --- */
+
+/**
+ * Lock the most recent complete frame buffer. Returns a direct pointer
+ * to the RGB565 pixel data — no copy. The buffer will not be overwritten
+ * by the camera while locked. Returns NULL if no frame is available yet
+ * or if frame access is paused.
+ *
+ * The caller MUST call release_frame() when done. Holding the lock too
+ * long does not cause corruption — the camera and display continue using
+ * the other two buffers — but it reduces the buffer pool and may cause
+ * the camera to overwrite the back buffer in place if both remaining
+ * buffers are also in use.
+ */
+const uint8_t *cam_pipeline_lock_frame(cam_pipeline_handle_t handle);
+
+/**
+ * Release a previously locked frame buffer back to the pool.
+ */
+void cam_pipeline_release_frame(cam_pipeline_handle_t handle);
+
+/* --- Camera control (callable anytime between create/destroy) --- */
+
+esp_err_t cam_pipeline_set_ae_target(cam_pipeline_handle_t handle,
+                                     uint8_t target);
+esp_err_t cam_pipeline_set_focus(cam_pipeline_handle_t handle,
+                                 uint16_t position);
+bool cam_pipeline_has_focus_motor(cam_pipeline_handle_t handle);
+
+/* --- Frame access control --- */
+
+/**
+ * Pause frame access. lock_frame() will return NULL until resumed.
+ * Camera streaming and display preview continue unaffected.
+ * Useful while adjusting exposure/focus so consumers don't waste cycles
+ * on transitional frames.
+ */
+void cam_pipeline_pause_frame_access(cam_pipeline_handle_t handle);
+
+/**
+ * Resume frame access after pause.
+ */
+void cam_pipeline_resume_frame_access(cam_pipeline_handle_t handle);
+
+/* --- Display overlay --- */
+
+/**
+ * Get overlay parent for app UI widgets (display-driver-specific).
+ * Returns lv_obj_t* for LVGL driver, NULL for raw framebuffer drivers.
+ * App creates children on this object — they render on top of video feed.
+ */
+void *cam_pipeline_get_overlay_parent(cam_pipeline_handle_t handle);
+
+/* --- Debug stats (only available when CONFIG_CAM_PIPELINE_DEBUG is set) --- */
+
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+typedef struct {
+    float camera_fps;
+    float display_fps;
+    float display_skip_pct;
+    float consumer_fps;
+    float avg_consumer_lock_wait_ms;
+    float avg_consumer_hold_time_ms;
+    float avg_grayscale_ms;      // 0 if preview-only mode
+    float avg_quirc_ms;          // 0 if preview-only mode
+    float qr_detections_per_sec; // 0 if preview-only mode
+} cam_pipeline_debug_stats_t;
+
+/**
+ * Read current debug metrics. Stats are computed from counters since
+ * the last internal log interval reset. App can poll this to render
+ * metrics into LVGL labels on the overlay parent.
+ */
+esp_err_t cam_pipeline_get_debug_stats(cam_pipeline_handle_t handle,
+                                       cam_pipeline_debug_stats_t *stats);
+#endif

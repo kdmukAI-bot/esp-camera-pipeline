@@ -1,0 +1,576 @@
+/*
+ * ESP Camera Pipeline — Core Engine
+ *
+ * Triple-buffered camera → display → consumer pipeline.
+ * Extracted and evolved from Kern main/qr/scanner.c.
+ *
+ * Three independent frame rates:
+ *   Camera  — sensor native rate (the only hard clock)
+ *   Display — up to camera rate, skips if display lock unavailable
+ *   Consumer — whatever pace the consumer sustains via lock/release
+ *
+ * None of the three stages block each other.
+ */
+
+#include "esp_cam_pipeline_internal.h"
+#include "qr_decode.h"
+#include <esp_heap_caps.h>
+#include <esp_log.h>
+#include <esp_timer.h>
+#include <inttypes.h>
+#include <string.h>
+
+static const char *TAG = "cam_pipeline";
+
+/*
+ * Buffer allocation with SPIRAM preferred, internal RAM fallback.
+ */
+static uint8_t *allocate_buffer(size_t size) {
+    uint8_t *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return buf;
+}
+
+/*
+ * Center-crop camera frame to display dimensions.
+ * Camera must be >= display in both dimensions.
+ */
+static void horizontal_crop(const uint8_t *camera_buf, uint8_t *display_buf,
+                            uint32_t camera_width, uint32_t camera_height,
+                            uint32_t display_width, uint32_t display_height) {
+    if (camera_width < display_width || camera_height < display_height) {
+        ESP_LOGE(TAG,
+                 "Camera resolution %" PRIu32 "x%" PRIu32
+                 " smaller than display %" PRIu32 "x%" PRIu32,
+                 camera_width, camera_height, display_width, display_height);
+        return;
+    }
+
+    uint32_t crop_x = (camera_width - display_width) / 2;
+    uint32_t crop_y = (camera_height - display_height) / 2;
+    const uint16_t *src = (const uint16_t *)camera_buf;
+    uint16_t *dst = (uint16_t *)display_buf;
+
+    for (uint32_t y = 0; y < display_height; y++) {
+        const uint16_t *src_row = src + ((y + crop_y) * camera_width) + crop_x;
+        uint16_t *dst_row = dst + (y * display_width);
+        memcpy(dst_row, src_row, display_width * 2);
+    }
+}
+
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+/* Non-static: called from qr_decode.c decode task for periodic logging */
+void log_debug_metrics(struct cam_pipeline *p) {
+    int64_t now = esp_timer_get_time();
+    int64_t elapsed_us = now - p->last_log_time;
+
+    if (elapsed_us < (CONFIG_CAM_PIPELINE_DEBUG_LOG_INTERVAL_MS * 1000)) {
+        return;
+    }
+
+    float elapsed_sec = elapsed_us / 1000000.0f;
+    float camera_fps = p->camera_frames / elapsed_sec;
+    float display_fps = p->display_frames / elapsed_sec;
+    float display_skip_pct = 0;
+    if (p->camera_frames > 0) {
+        display_skip_pct =
+            (p->display_skips * 100.0f) / p->camera_frames;
+    }
+    float consumer_fps = p->consumer_frames / elapsed_sec;
+
+    float avg_lock_wait_ms = 0;
+    float avg_hold_time_ms = 0;
+    if (p->consumer_frames > 0) {
+        avg_lock_wait_ms =
+            (p->consumer_lock_wait_us / p->consumer_frames) / 1000.0f;
+        avg_hold_time_ms =
+            (p->consumer_hold_time_us / p->consumer_frames) / 1000.0f;
+    }
+
+    if (p->on_qr_decoded) {
+        float avg_gray_ms = 0;
+        float avg_quirc_ms = 0;
+        float detections_per_sec = p->qr_detections / elapsed_sec;
+
+        if (p->consumer_frames > 0) {
+            avg_gray_ms =
+                (p->grayscale_time_us / p->consumer_frames) / 1000.0f;
+            avg_quirc_ms =
+                (p->quirc_time_us / p->consumer_frames) / 1000.0f;
+        }
+
+        ESP_LOGI(TAG,
+                 "cam=%.1ffps disp=%.1ffps(skip %.0f%%) "
+                 "decode=%.1ffps(gray=%.1fms quirc=%.1fms) "
+                 "det/s=%.1f lock_wait=%.1fms hold=%.1fms",
+                 camera_fps, display_fps, display_skip_pct, consumer_fps,
+                 avg_gray_ms, avg_quirc_ms, detections_per_sec,
+                 avg_lock_wait_ms, avg_hold_time_ms);
+    } else {
+        ESP_LOGI(TAG,
+                 "cam=%.1ffps disp=%.1ffps(skip %.0f%%) "
+                 "consumer=%.1ffps lock_wait=%.1fms hold=%.1fms",
+                 camera_fps, display_fps, display_skip_pct, consumer_fps,
+                 avg_lock_wait_ms, avg_hold_time_ms);
+    }
+
+    // Reset counters
+    p->camera_frames = 0;
+    p->display_frames = 0;
+    p->display_skips = 0;
+    p->consumer_frames = 0;
+    p->consumer_lock_wait_us = 0;
+    p->consumer_hold_time_us = 0;
+    p->grayscale_time_us = 0;
+    p->quirc_time_us = 0;
+    p->qr_detections = 0;
+    p->last_log_time = now;
+}
+#endif
+
+/*
+ * Camera frame callback — called by the camera driver for each captured frame.
+ * Runs on the camera driver's core (typically Core 0).
+ *
+ * Triple buffer selection: picks whichever buffer is neither front nor locked
+ * as the back buffer. If only one buffer is available (the other two are front
+ * and locked), it still works — the camera writes to the only free buffer.
+ * If the camera fires again before the consumer releases, it overwrites the
+ * back buffer in place (latest frame wins).
+ */
+static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
+                     uint32_t camera_height, void *user_ctx) {
+    struct cam_pipeline *p = (struct cam_pipeline *)user_ctx;
+
+    __atomic_add_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
+
+    if (p->closing || p->destruction_in_progress || !p->is_initialized ||
+        !p->event_group) {
+        __atomic_sub_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+
+    EventBits_t bits = xEventGroupGetBits(p->event_group);
+    if (!(bits & EVENT_TASK_RUN) || (bits & EVENT_DELETE)) {
+        __atomic_sub_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+    __atomic_add_fetch(&p->camera_frames, 1, __ATOMIC_RELAXED);
+#endif
+
+    // Select back buffer: whichever of the 3 is neither front nor locked
+    xSemaphoreTake(p->buffer_mutex, portMAX_DELAY);
+    uint8_t *back = NULL;
+    for (int i = 0; i < 3; i++) {
+        if (p->buffers[i] != p->front_buffer &&
+            p->buffers[i] != p->locked_buffer) {
+            back = p->buffers[i];
+            break;
+        }
+    }
+    p->back_buffer = back;
+    xSemaphoreGive(p->buffer_mutex);
+
+    if (!back) {
+        // All three buffers occupied — shouldn't happen with single consumer,
+        // but guard defensively
+        __atomic_sub_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+
+    // Crop camera frame into back buffer
+    horizontal_crop(camera_buf, back, camera_width, camera_height,
+                    p->display_width, p->display_height);
+
+    // PPA counter-rotate if available (P4 only)
+    uint8_t *display_src = back;
+#if SOC_PPA_SUPPORTED
+    if (p->ppa_client && p->ppa_buffer && !p->closing) {
+        ppa_srm_oper_config_t srm = {
+            .in.buffer = back,
+            .in.pic_w = p->display_width,
+            .in.pic_h = p->display_height,
+            .in.block_w = p->display_width,
+            .in.block_h = p->display_height,
+            .in.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+            .out.buffer = p->ppa_buffer,
+            .out.buffer_size = p->ppa_buffer_size,
+            .out.pic_w = p->display_width,
+            .out.pic_h = p->display_height,
+            .out.srm_cm = PPA_SRM_COLOR_MODE_RGB565,
+            .rotation_angle = p->ppa_angle,
+            .scale_x = 1.0,
+            .scale_y = 1.0,
+            .mode = PPA_TRANS_MODE_BLOCKING,
+        };
+        if (ppa_do_scale_rotate_mirror(p->ppa_client, &srm) == ESP_OK) {
+            display_src = p->ppa_buffer;
+        }
+    }
+#endif
+
+    // Push to display (non-blocking — skip if display is busy)
+    if (!p->closing && !p->destruction_in_progress && p->display_handle) {
+        bool pushed = p->display_driver->push_frame(
+            p->display_handle, display_src,
+            p->display_width, p->display_height);
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+        if (pushed) {
+            __atomic_add_fetch(&p->display_frames, 1, __ATOMIC_RELAXED);
+        } else {
+            __atomic_add_fetch(&p->display_skips, 1, __ATOMIC_RELAXED);
+        }
+#else
+        (void)pushed;
+#endif
+    }
+
+    // Promote back → front
+    xSemaphoreTake(p->buffer_mutex, portMAX_DELAY);
+    p->front_buffer = back;
+    xSemaphoreGive(p->buffer_mutex);
+
+    __atomic_sub_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
+}
+
+/* --- Public API --- */
+
+const uint8_t *cam_pipeline_lock_frame(cam_pipeline_handle_t handle) {
+    if (!handle || handle->closing || handle->frame_access_paused) {
+        return NULL;
+    }
+
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+    int64_t wait_start = esp_timer_get_time();
+#endif
+
+    xSemaphoreTake(handle->buffer_mutex, portMAX_DELAY);
+
+    if (!handle->front_buffer || handle->locked_buffer) {
+        xSemaphoreGive(handle->buffer_mutex);
+        return NULL;
+    }
+
+    handle->locked_buffer = handle->front_buffer;
+    xSemaphoreGive(handle->buffer_mutex);
+
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+    int64_t wait_end = esp_timer_get_time();
+    __atomic_add_fetch(&handle->consumer_lock_wait_us,
+                       (uint64_t)(wait_end - wait_start), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&handle->consumer_frames, 1, __ATOMIC_RELAXED);
+#endif
+
+    return handle->locked_buffer;
+}
+
+void cam_pipeline_release_frame(cam_pipeline_handle_t handle) {
+    if (!handle) {
+        return;
+    }
+
+    xSemaphoreTake(handle->buffer_mutex, portMAX_DELAY);
+    handle->locked_buffer = NULL;
+    xSemaphoreGive(handle->buffer_mutex);
+}
+
+cam_pipeline_handle_t
+cam_pipeline_create(const cam_pipeline_config_t *config) {
+    if (!config || !config->camera_driver || !config->display_driver) {
+        ESP_LOGE(TAG, "Invalid config: camera and display drivers required");
+        return NULL;
+    }
+
+    struct cam_pipeline *p = calloc(1, sizeof(struct cam_pipeline));
+    if (!p) {
+        ESP_LOGE(TAG, "Failed to allocate pipeline struct");
+        return NULL;
+    }
+
+    p->display_width = config->display_width;
+    p->display_height = config->display_height;
+    p->camera_driver = config->camera_driver;
+    p->display_driver = config->display_driver;
+    p->on_qr_decoded = config->on_qr_decoded;
+    p->user_ctx = config->user_ctx;
+
+    // Allocate three frame buffers (RGB565: width * height * 2 bytes each)
+    p->buffer_size = config->display_width * config->display_height * 2;
+    for (int i = 0; i < 3; i++) {
+        p->buffers[i] = allocate_buffer(p->buffer_size);
+        if (!p->buffers[i]) {
+            ESP_LOGE(TAG, "Failed to allocate frame buffer %d", i);
+            goto error;
+        }
+    }
+    // Initialize: front = buffer[0], back and locked start NULL
+    p->front_buffer = p->buffers[0];
+    p->back_buffer = NULL;
+    p->locked_buffer = NULL;
+
+    p->buffer_mutex = xSemaphoreCreateMutex();
+    if (!p->buffer_mutex) {
+        ESP_LOGE(TAG, "Failed to create buffer mutex");
+        goto error;
+    }
+
+    p->event_group = xEventGroupCreate();
+    if (!p->event_group) {
+        ESP_LOGE(TAG, "Failed to create event group");
+        goto error;
+    }
+
+    // Initialize display driver
+    p->display_handle = p->display_driver->init(
+        config->display_parent, config->display_width,
+        config->display_height, config->display_config);
+    if (!p->display_handle) {
+        ESP_LOGE(TAG, "Display driver init failed");
+        goto error;
+    }
+
+    // Initialize camera driver
+    p->camera_handle = p->camera_driver->init(config->camera_config);
+    if (!p->camera_handle) {
+        ESP_LOGE(TAG, "Camera driver init failed");
+        goto error;
+    }
+
+    // QR decode mode: set up decoder resources before starting camera
+    if (config->on_qr_decoded) {
+        if (!qr_decode_init(p)) {
+            ESP_LOGE(TAG, "QR decode init failed");
+            goto error;
+        }
+    }
+
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+    p->last_log_time = esp_timer_get_time();
+#endif
+
+    // Start camera streaming — frame_cb runs on camera driver's core
+    xEventGroupSetBits(p->event_group, EVENT_TASK_RUN);
+    p->is_initialized = true;
+
+    esp_err_t err =
+        p->camera_driver->start(p->camera_handle, frame_cb, p, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Camera driver start failed: %s", esp_err_to_name(err));
+        p->is_initialized = false;
+        goto error;
+    }
+
+    ESP_LOGI(TAG, "Pipeline created: %" PRIu32 "x%" PRIu32 " %s mode",
+             config->display_width, config->display_height,
+             config->on_qr_decoded ? "QR decode" : "preview-only");
+
+    return p;
+
+error:
+    cam_pipeline_destroy(p);
+    return NULL;
+}
+
+void cam_pipeline_destroy(cam_pipeline_handle_t handle) {
+    if (!handle) {
+        return;
+    }
+
+    struct cam_pipeline *p = handle;
+
+    p->destruction_in_progress = true;
+    p->closing = true;
+    p->is_initialized = false;
+
+    // Signal camera task to stop
+    if (p->event_group) {
+        xEventGroupClearBits(p->event_group, EVENT_TASK_RUN);
+        xEventGroupSetBits(p->event_group, EVENT_DELETE);
+    }
+
+    // Wait for in-flight frame callbacks to drain (300ms max)
+    int wait_count = 0;
+    while (__atomic_load_n(&p->active_frame_operations, __ATOMIC_SEQ_CST) > 0 &&
+           wait_count < 30) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        wait_count++;
+    }
+    int remaining = __atomic_load_n(&p->active_frame_operations, __ATOMIC_SEQ_CST);
+    if (remaining > 0) {
+        ESP_LOGW(TAG, "Timeout waiting for frame operations (remaining: %d)",
+                 remaining);
+    }
+
+    // Stop camera
+    if (p->camera_handle) {
+        p->camera_driver->stop(p->camera_handle);
+        p->camera_driver->deinit(p->camera_handle);
+        p->camera_handle = NULL;
+    }
+
+    // Clean up QR decode resources
+    if (p->on_qr_decoded) {
+        qr_decode_cleanup(p);
+    }
+
+    // Clean up display
+    if (p->display_handle) {
+        p->display_driver->deinit(p->display_handle);
+        p->display_handle = NULL;
+    }
+
+    // Free frame buffers
+    for (int i = 0; i < 3; i++) {
+        if (p->buffers[i]) {
+            heap_caps_free(p->buffers[i]);
+            p->buffers[i] = NULL;
+        }
+    }
+    p->front_buffer = NULL;
+    p->back_buffer = NULL;
+    p->locked_buffer = NULL;
+
+    // Free PPA resources
+#if SOC_PPA_SUPPORTED
+    if (p->ppa_client) {
+        ppa_unregister_client(p->ppa_client);
+        p->ppa_client = NULL;
+    }
+    if (p->ppa_buffer) {
+        free(p->ppa_buffer);
+        p->ppa_buffer = NULL;
+    }
+#endif
+
+    if (p->buffer_mutex) {
+        vSemaphoreDelete(p->buffer_mutex);
+        p->buffer_mutex = NULL;
+    }
+
+    if (p->event_group) {
+        vEventGroupDelete(p->event_group);
+        p->event_group = NULL;
+    }
+
+    free(p);
+    ESP_LOGI(TAG, "Pipeline destroyed");
+}
+
+/* --- Camera controls --- */
+
+esp_err_t cam_pipeline_set_ae_target(cam_pipeline_handle_t handle,
+                                     uint8_t target) {
+    if (!handle || !handle->camera_handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!handle->camera_driver->set_ae_target) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    return handle->camera_driver->set_ae_target(handle->camera_handle, target);
+}
+
+esp_err_t cam_pipeline_set_focus(cam_pipeline_handle_t handle,
+                                 uint16_t position) {
+    if (!handle || !handle->camera_handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!handle->camera_driver->set_focus) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    return handle->camera_driver->set_focus(handle->camera_handle, position);
+}
+
+bool cam_pipeline_has_focus_motor(cam_pipeline_handle_t handle) {
+    if (!handle || !handle->camera_handle) {
+        return false;
+    }
+    if (!handle->camera_driver->has_focus_motor) {
+        return false;
+    }
+    return handle->camera_driver->has_focus_motor(handle->camera_handle);
+}
+
+/* --- Frame access control --- */
+
+void cam_pipeline_pause_frame_access(cam_pipeline_handle_t handle) {
+    if (handle) {
+        handle->frame_access_paused = true;
+    }
+}
+
+void cam_pipeline_resume_frame_access(cam_pipeline_handle_t handle) {
+    if (handle) {
+        handle->frame_access_paused = false;
+    }
+}
+
+/* --- Display overlay --- */
+
+void *cam_pipeline_get_overlay_parent(cam_pipeline_handle_t handle) {
+    if (!handle || !handle->display_handle) {
+        return NULL;
+    }
+    if (!handle->display_driver->get_overlay_parent) {
+        return NULL;
+    }
+    return handle->display_driver->get_overlay_parent(handle->display_handle);
+}
+
+/* --- Debug stats --- */
+
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+esp_err_t cam_pipeline_get_debug_stats(cam_pipeline_handle_t handle,
+                                       cam_pipeline_debug_stats_t *stats) {
+    if (!handle || !stats) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int64_t now = esp_timer_get_time();
+    int64_t elapsed_us = now - handle->last_log_time;
+    float elapsed_sec = elapsed_us / 1000000.0f;
+
+    if (elapsed_sec <= 0) {
+        memset(stats, 0, sizeof(*stats));
+        return ESP_OK;
+    }
+
+    stats->camera_fps = handle->camera_frames / elapsed_sec;
+    stats->display_fps = handle->display_frames / elapsed_sec;
+    stats->display_skip_pct = 0;
+    if (handle->camera_frames > 0) {
+        stats->display_skip_pct =
+            (handle->display_skips * 100.0f) / handle->camera_frames;
+    }
+    stats->consumer_fps = handle->consumer_frames / elapsed_sec;
+
+    if (handle->consumer_frames > 0) {
+        stats->avg_consumer_lock_wait_ms =
+            (handle->consumer_lock_wait_us / handle->consumer_frames) /
+            1000.0f;
+        stats->avg_consumer_hold_time_ms =
+            (handle->consumer_hold_time_us / handle->consumer_frames) /
+            1000.0f;
+    } else {
+        stats->avg_consumer_lock_wait_ms = 0;
+        stats->avg_consumer_hold_time_ms = 0;
+    }
+
+    if (handle->on_qr_decoded && handle->consumer_frames > 0) {
+        stats->avg_grayscale_ms =
+            (handle->grayscale_time_us / handle->consumer_frames) / 1000.0f;
+        stats->avg_quirc_ms =
+            (handle->quirc_time_us / handle->consumer_frames) / 1000.0f;
+        stats->qr_detections_per_sec = handle->qr_detections / elapsed_sec;
+    } else {
+        stats->avg_grayscale_ms = 0;
+        stats->avg_quirc_ms = 0;
+        stats->qr_detections_per_sec = 0;
+    }
+
+    return ESP_OK;
+}
+#endif
