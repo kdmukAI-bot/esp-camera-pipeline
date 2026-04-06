@@ -190,8 +190,8 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
          * Quantize to the next higher representable scale so the output
          * is >= target dimensions, then center the oversized result. */
         float q_scale = ceilf(scale * 16.0f) / 16.0f;
-        uint32_t in_w = (uint32_t)(target_w / q_scale);
-        uint32_t in_h = (uint32_t)(target_h / q_scale);
+        uint32_t in_w = (uint32_t)ceilf((float)target_w / q_scale);
+        uint32_t in_h = (uint32_t)ceilf((float)target_h / q_scale);
         if (in_w > camera_width) in_w = camera_width;
         if (in_h > camera_height) in_h = camera_height;
         uint32_t off_x = (camera_width - in_w) / 2;
