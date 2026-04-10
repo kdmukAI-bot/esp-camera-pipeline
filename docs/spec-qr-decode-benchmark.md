@@ -32,7 +32,7 @@ struggling.
 
 | Axis | Values |
 |---|---|
-| QR version | 1 through K_QUIRC_MAX_VERSION (default 25) |
+| QR version | 1 through 25 (hardcoded upstream maximum) |
 | ECC level | L (fixed — matches our use case) |
 | Pixels per module | 8, 5, 3, 2 |
 | Preprocessing features | contrast stretch, adaptive threshold, bilinear threshold (on/off) |
@@ -89,7 +89,7 @@ qr-decode-bench/
     qr_test_images.c/.h      # generated module grids (build artifact)
     Kconfig.projbuild         # iteration counts, frame size, PPM list
   components/
-    k_quirc/                 # copy for now; submodule when k_quirc gets its own repo
+    k_quirc/                 # submodule from kdmukAI-bot/k_quirc (seedsigner-dev branch)
   scripts/
     generate_qr_grids.py     # host: QR version → C module grid arrays
     analyze_results.py        # host: parse CSV, produce comparison charts
@@ -106,4 +106,19 @@ qr-decode-bench/
 3. What's the P4 speedup over S3 at each test point?
 4. How much does each preprocessing feature cost per frame?
 5. At what PPM does decode start failing (predicts effective camera range)?
-6. Where should K_QUIRC_MAX_VERSION be set per platform?
+
+### QR version producer guidelines
+
+The max QR version that a scanner can reliably decode is limited by camera
+resolution, not the decoder setting (hardcoded at 25). These are recommendations
+for QR code generators targeting SeedSigner devices:
+
+| Scanner frame size | Recommended max QR version | PPM at 90% fill |
+|---|---|---|
+| 320x320 (S3) | 12 | ~4.4 |
+| 480x480 (P4) | 16-18 | ~4.9-4.1 |
+| 640x640 | 25 | ~4.9 |
+
+Beyond these limits, payloads should be split into animated frames (BBQr/UR).
+A typical 2-of-3 multisig wallet descriptor (~430 bytes) fits in QR version 14,
+well within all frame sizes above.
