@@ -13,6 +13,7 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -122,8 +123,15 @@ struct cam_pipeline_qr {
     volatile uint32_t consumer_frames;
     volatile uint64_t grayscale_time_us;
     volatile uint64_t quirc_time_us;
-    volatile uint32_t qr_detections;
+    volatile uint32_t qr_detections;     /* valid decodes this window (codes) */
+    volatile uint32_t frames_identified; /* frames where >=1 QR was located */
+    volatile uint32_t frames_decoded;    /* frames where >=1 QR decoded valid */
+    volatile uint32_t total_decodes;     /* monotonic valid decodes since create */
+    volatile uint32_t missed_codes;      /* located-but-undecoded codes (window) */
+    volatile float last_px_per_module;   /* last successful decode, for HUD */
+    volatile uint16_t last_modules;      /* last successful decode module count */
     int64_t last_log_time;
+    cam_pipeline_qr_debug_stats_t last_stats; /* latest snapshot for getter */
 #endif
 };
 
@@ -143,22 +151,46 @@ static void log_debug_metrics(struct cam_pipeline_qr *qr) {
     float avg_gray_ms = 0;
     float avg_quirc_ms = 0;
     float detections_per_sec = qr->qr_detections / elapsed_sec;
+    /* Resolution-sweep reliability: identify% = frames where the QR was
+     * located (finder patterns found); ok% = frames that fully decoded. A
+     * high id% with a low ok% means the square is big enough to *find* the QR
+     * but too small to *resolve* its modules -- the decode knee. */
+    float identify_pct = 0;
+    float decode_pct = 0;
 
     if (qr->consumer_frames > 0) {
         avg_gray_ms =
             (qr->grayscale_time_us / qr->consumer_frames) / 1000.0f;
         avg_quirc_ms =
             (qr->quirc_time_us / qr->consumer_frames) / 1000.0f;
+        identify_pct =
+            100.0f * qr->frames_identified / qr->consumer_frames;
+        decode_pct =
+            100.0f * qr->frames_decoded / qr->consumer_frames;
     }
 
     ESP_LOGI(TAG,
-             "decode=%.1ffps(gray=%.1fms quirc=%.1fms) det/s=%.1f",
-             consumer_fps, avg_gray_ms, avg_quirc_ms, detections_per_sec);
+             "decode=%.1ffps(gray=%.1fms quirc=%.1fms) det/s=%.1f "
+             "id=%.0f%% ok=%.0f%%",
+             consumer_fps, avg_gray_ms, avg_quirc_ms, detections_per_sec,
+             identify_pct, decode_pct);
+
+    qr->last_stats = (cam_pipeline_qr_debug_stats_t){
+        .decode_fps = consumer_fps,
+        .gray_ms = avg_gray_ms,
+        .quirc_ms = avg_quirc_ms,
+        .detections_per_sec = detections_per_sec,
+        .identify_pct = identify_pct,
+        .decode_pct = decode_pct,
+        .total_decodes = qr->total_decodes,
+    };
 
     qr->consumer_frames = 0;
     qr->grayscale_time_us = 0;
     qr->quirc_time_us = 0;
     qr->qr_detections = 0;
+    qr->frames_identified = 0;
+    qr->frames_decoded = 0;
     qr->last_log_time = now;
 }
 #endif
@@ -206,6 +238,13 @@ static void qr_decode_task(void *pvParameters) {
 #endif
 
             int num_codes = k_quirc_count(qr->qr_decoder);
+#ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+            bool frame_decoded = false;
+            if (num_codes > 0) {
+                __atomic_add_fetch(&qr->frames_identified, 1,
+                                   __ATOMIC_RELAXED);
+            }
+#endif
             for (int i = 0; i < num_codes; i++) {
                 if (qr->closing) {
                     break;
@@ -213,18 +252,66 @@ static void qr_decode_task(void *pvParameters) {
 
                 k_quirc_error_t err =
                     k_quirc_decode(qr->qr_decoder, i, &qr_result);
+
+#ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+                /* QR side length in pixels (mean of the 4 edges from quirc's
+                 * corners). quirc populates corners even on decode failure
+                 * (corners-on-failure fix), so a located-but-undecoded code can
+                 * still be measured. */
+                float perim = 0.0f;
+                for (int e = 0; e < 4; e++) {
+                    int b = (e + 1) & 3;
+                    float dx = (float)(qr_result.corners[b].x -
+                                       qr_result.corners[e].x);
+                    float dy = (float)(qr_result.corners[b].y -
+                                       qr_result.corners[e].y);
+                    perim += sqrtf(dx * dx + dy * dy);
+                }
+                float side_px = perim / 4.0f;
+#endif
+
                 if (err == K_QUIRC_SUCCESS && qr_result.valid) {
 #ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
                     __atomic_add_fetch(&qr->qr_detections, 1,
                                        __ATOMIC_RELAXED);
+                    __atomic_add_fetch(&qr->total_decodes, 1,
+                                       __ATOMIC_RELAXED);
+                    frame_decoded = true;
+                    /* Per-decode measured resolution; lets a distance sweep map
+                     * decode success vs ACTUAL px/module, independent of any fill
+                     * assumption. Short payload prefix carries the UR part header
+                     * for animated dedup. Stash for the live HUD readout. */
+                    int modules = 4 * qr_result.data.version + 17;
+                    float px_per_mod = modules ? side_px / modules : 0.0f;
+                    qr->last_px_per_module = px_per_mod;
+                    qr->last_modules = (uint16_t)modules;
+                    ESP_LOGI(TAG,
+                             "QRPX v%d mod%d side%.0fpx %.2fpx/mod len%d %.24s",
+                             qr_result.data.version, modules, side_px,
+                             px_per_mod, qr_result.data.payload_len,
+                             (const char *)qr_result.data.payload);
 #endif
                     qr->on_decoded(qr_result.data.payload,
                                    qr_result.data.payload_len,
                                    &qr_result.data, qr->user_ctx);
                 }
+#ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+                else {
+                    /* Located but not decoded: report measured pixel size + the
+                     * quirc error so a distance sweep shows WHERE detection
+                     * succeeds but decode fails (e.g. blown-out highlights up
+                     * close). Module count is unknown — decode failed. */
+                    __atomic_add_fetch(&qr->missed_codes, 1, __ATOMIC_RELAXED);
+                    ESP_LOGI(TAG, "QRMISS side%.0fpx err=%d(%s)",
+                             side_px, err, k_quirc_strerror(err));
+                }
+#endif
             }
 
 #ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+            if (frame_decoded) {
+                __atomic_add_fetch(&qr->frames_decoded, 1, __ATOMIC_RELAXED);
+            }
             __atomic_add_fetch(&qr->consumer_frames, 1, __ATOMIC_RELAXED);
             __atomic_add_fetch(&qr->grayscale_time_us,
                                (uint64_t)(gray_end - gray_start),
@@ -320,6 +407,28 @@ cam_pipeline_qr_create(const cam_pipeline_qr_config_t *config) {
 error:
     cam_pipeline_qr_destroy(qr);
     return NULL;
+}
+
+bool cam_pipeline_qr_get_debug_stats(cam_pipeline_qr_handle_t handle,
+                                     cam_pipeline_qr_debug_stats_t *out) {
+    if (!out) {
+        return false;
+    }
+#ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
+    if (!handle) {
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+    *out = handle->last_stats;
+    out->total_decodes = handle->total_decodes; /* freshest monotonic count */
+    out->last_px_per_module = handle->last_px_per_module; /* fresh, per-decode */
+    out->last_modules = handle->last_modules;
+    return true;
+#else
+    (void)handle;
+    memset(out, 0, sizeof(*out));
+    return false;
+#endif
 }
 
 void cam_pipeline_qr_destroy(cam_pipeline_qr_handle_t handle) {

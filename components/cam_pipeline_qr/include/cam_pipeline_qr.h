@@ -46,3 +46,27 @@ cam_pipeline_qr_create(const cam_pipeline_qr_config_t *config);
  * The pipeline itself is not affected.
  */
 void cam_pipeline_qr_destroy(cam_pipeline_qr_handle_t handle);
+
+/**
+ * Decode reliability + timing snapshot, refreshed once per debug-log interval.
+ * Populated only when CONFIG_CAM_PIPELINE_QR_DEBUG is enabled.
+ */
+typedef struct {
+    float decode_fps;          /* frames processed per second */
+    float gray_ms;             /* avg grayscale conversion time */
+    float quirc_ms;            /* avg quirc identify+decode time */
+    float detections_per_sec;  /* valid decodes per second */
+    float identify_pct;        /* % of frames where a QR was located */
+    float decode_pct;          /* % of frames that fully decoded (reliability) */
+    uint32_t total_decodes;    /* monotonic count of valid decodes since create */
+    float last_px_per_module;  /* measured px/module of the latest decode (HUD) */
+    uint16_t last_modules;     /* module count of the latest decode */
+} cam_pipeline_qr_debug_stats_t;
+
+/**
+ * Copy the latest reliability/timing snapshot into *out.
+ * Returns true if stats are available (debug build + at least one interval
+ * elapsed), false otherwise (out is zeroed).
+ */
+bool cam_pipeline_qr_get_debug_stats(cam_pipeline_qr_handle_t handle,
+                                     cam_pipeline_qr_debug_stats_t *out);

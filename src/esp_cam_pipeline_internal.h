@@ -41,6 +41,11 @@ struct cam_pipeline {
     // Frame access control
     volatile bool frame_access_paused;
 
+    // Demand-driven frame skip: skip PPA processing when no consumer has
+    // picked up the previous frame.  Skip at most 1 consecutive frame.
+    volatile bool front_consumed;
+    volatile int skip_count;
+
     // Lifecycle control
     EventGroupHandle_t event_group;
     volatile bool closing;

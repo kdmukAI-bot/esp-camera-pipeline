@@ -148,6 +148,26 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
     log_debug_metrics(p);
 #endif
 
+    /* Demand-driven frame skip: if no consumer has picked up the previous
+     * frame, skip this one to avoid wasting PPA time.  Skip at most 1
+     * frame — guarantees max staleness of 2 camera periods and keeps
+     * enough processed frames flowing to feed the display. */
+    if (!p->front_consumed && p->skip_count < 1 && p->front_buffer) {
+        p->skip_count++;
+        static int skip_total = 0;
+        static int64_t skip_last_log = 0;
+        skip_total++;
+        int64_t now = esp_timer_get_time();
+        if (now - skip_last_log > 2000000) {
+            ESP_LOGI(TAG, "CAM SKIP: %d frames in 2s", skip_total);
+            skip_total = 0;
+            skip_last_log = now;
+        }
+        __atomic_sub_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
+        return;
+    }
+    p->skip_count = 0;
+
     // Select back buffer: whichever of the 3 is neither front nor locked
     xSemaphoreTake(p->buffer_mutex, portMAX_DELAY);
     uint8_t *back = NULL;
@@ -223,6 +243,7 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
             ppa_logged = true;
         }
 
+        int64_t ppa_t0 = esp_timer_get_time();
         ppa_srm_oper_config_t srm = {
             .in.buffer = camera_buf,
             .in.pic_w = camera_width,
@@ -248,6 +269,25 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
             horizontal_crop(camera_buf, back, camera_width, camera_height,
                             p->display_width, p->display_height);
         }
+        int64_t ppa_t1 = esp_timer_get_time();
+
+        static int64_t cam_ppa_sum = 0;
+        static int64_t cam_ppa_max = 0;
+        static int cam_ppa_count = 0;
+        static int64_t cam_ppa_last_log = 0;
+        int64_t cam_ppa_dur = ppa_t1 - ppa_t0;
+        cam_ppa_sum += cam_ppa_dur;
+        if (cam_ppa_dur > cam_ppa_max) cam_ppa_max = cam_ppa_dur;
+        cam_ppa_count++;
+        if (ppa_t1 - cam_ppa_last_log > 2000000) {  /* every 2s */
+            ESP_LOGI(TAG, "CAM PPA: avg=%lld us  max=%lld us  n=%d",
+                     (long long)(cam_ppa_sum / cam_ppa_count),
+                     (long long)cam_ppa_max, cam_ppa_count);
+            cam_ppa_sum = 0;
+            cam_ppa_max = 0;
+            cam_ppa_count = 0;
+            cam_ppa_last_log = ppa_t1;
+        }
     } else {
         horizontal_crop(camera_buf, back, camera_width, camera_height,
                         p->display_width, p->display_height);
@@ -263,20 +303,22 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
         bool pushed = p->display_driver->push_frame(
             p->display_handle, display_src,
             p->display_width, p->display_height);
+        if (pushed) {
+            p->front_consumed = true;  // display used this frame — process next
+        }
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
         if (pushed) {
             __atomic_add_fetch(&p->display_frames, 1, __ATOMIC_RELAXED);
         } else {
             __atomic_add_fetch(&p->display_skips, 1, __ATOMIC_RELAXED);
         }
-#else
-        (void)pushed;
 #endif
     }
 
     // Promote back → front
     xSemaphoreTake(p->buffer_mutex, portMAX_DELAY);
     p->front_buffer = back;
+    p->front_consumed = false;
     xSemaphoreGive(p->buffer_mutex);
 
     __atomic_sub_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
@@ -301,6 +343,7 @@ const uint8_t *cam_pipeline_lock_frame(cam_pipeline_handle_t handle) {
     }
 
     handle->locked_buffer = handle->front_buffer;
+    handle->front_consumed = true;
     xSemaphoreGive(handle->buffer_mutex);
 
 #ifdef CONFIG_CAM_PIPELINE_DEBUG
@@ -354,6 +397,8 @@ cam_pipeline_create(const cam_pipeline_config_t *config) {
     p->front_buffer = p->buffers[0];
     p->back_buffer = NULL;
     p->locked_buffer = NULL;
+    p->front_consumed = true;   // don't skip the very first frame
+    p->skip_count = 0;
 
     p->buffer_mutex = xSemaphoreCreateMutex();
     if (!p->buffer_mutex) {
