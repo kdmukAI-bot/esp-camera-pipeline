@@ -16,19 +16,33 @@
 typedef struct cam_pipeline_qr *cam_pipeline_qr_handle_t;
 
 /**
- * Called from decode task for each successfully decoded QR code.
- * payload/len is the raw decoded data. metadata has version, ECC, data type.
- * Must return quickly -- runs in decode task context.
+ * Per-frame decode outcome, reported once per processed frame. The single
+ * event collapses payload delivery (DECODED) and the located-but-undecoded
+ * signal (MISS) so a consumer can drive a most-recent-frame indicator without
+ * correlating separate callbacks.
  */
-typedef void (*cam_pipeline_qr_cb_t)(const uint8_t *payload, size_t len,
-                                     const k_quirc_data_t *metadata,
-                                     void *user_ctx);
+typedef enum {
+    CAM_QR_NOTHING = 0,  // no QR located this frame
+    CAM_QR_MISS,         // QR located (corners valid) but decode failed
+    CAM_QR_DECODED,      // QR decoded -- payload/metadata valid
+} cam_pipeline_qr_outcome_t;
+
+/**
+ * Called from the decode task once per processed frame.
+ * `outcome` summarizes the frame; payload/len/metadata are valid ONLY when
+ * outcome == CAM_QR_DECODED (NULL/0 otherwise). A multi-code frame delivers the
+ * first decoded code's payload. Must return quickly -- runs in decode task context.
+ */
+typedef void (*cam_pipeline_qr_frame_cb_t)(cam_pipeline_qr_outcome_t outcome,
+                                           const uint8_t *payload, size_t len,
+                                           const k_quirc_data_t *metadata,
+                                           void *user_ctx);
 
 typedef struct {
     cam_pipeline_handle_t pipeline; // Pipeline to consume frames from
     uint32_t frame_width;           // Frame dimensions (for QR decoder sizing)
     uint32_t frame_height;
-    cam_pipeline_qr_cb_t on_decoded; // Callback for decoded QR results
+    cam_pipeline_qr_frame_cb_t on_frame; // Per-frame outcome callback
     void *user_ctx;                  // Passed to callback
 } cam_pipeline_qr_config_t;
 

@@ -154,6 +154,7 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
      * enough processed frames flowing to feed the display. */
     if (!p->front_consumed && p->skip_count < 1 && p->front_buffer) {
         p->skip_count++;
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
         static int skip_total = 0;
         static int64_t skip_last_log = 0;
         skip_total++;
@@ -163,6 +164,7 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
             skip_total = 0;
             skip_last_log = now;
         }
+#endif
         __atomic_sub_fetch(&p->active_frame_operations, 1, __ATOMIC_SEQ_CST);
         return;
     }
@@ -217,13 +219,12 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
         uint32_t off_x = (camera_width - in_w) / 2;
         uint32_t off_y = (camera_height - in_h) / 2;
 
-        /* Pre-rotation output (may be slightly larger than target) */
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
+        /* Pre-rotation output + post-rotation centering offset (debug log only) */
         uint32_t out_w = (uint32_t)(in_w * q_scale);
         uint32_t out_h = (uint32_t)(in_h * q_scale);
         if (out_w < target_w) out_w = target_w;
         if (out_h < target_h) out_h = target_h;
-
-        /* Post-rotation centering offset */
         uint32_t post_w = swap ? out_h : out_w;
         uint32_t post_h = swap ? out_w : out_h;
         uint32_t out_off_x = (post_w - p->display_width) / 2;
@@ -244,6 +245,7 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
         }
 
         int64_t ppa_t0 = esp_timer_get_time();
+#endif
         ppa_srm_oper_config_t srm = {
             .in.buffer = camera_buf,
             .in.pic_w = camera_width,
@@ -269,6 +271,7 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
             horizontal_crop(camera_buf, back, camera_width, camera_height,
                             p->display_width, p->display_height);
         }
+#ifdef CONFIG_CAM_PIPELINE_DEBUG
         int64_t ppa_t1 = esp_timer_get_time();
 
         static int64_t cam_ppa_sum = 0;
@@ -288,6 +291,7 @@ static void frame_cb(uint8_t *camera_buf, uint32_t camera_width,
             cam_ppa_count = 0;
             cam_ppa_last_log = ppa_t1;
         }
+#endif
     } else {
         horizontal_crop(camera_buf, back, camera_width, camera_height,
                         p->display_width, p->display_height);
