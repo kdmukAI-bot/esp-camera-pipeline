@@ -110,7 +110,7 @@ struct cam_pipeline_qr {
     uint32_t crop_size;      /* square crop dimension (min of w, h) */
     uint32_t crop_offset_x;  /* horizontal offset to center crop */
     uint32_t crop_offset_y;  /* vertical offset to center crop */
-    cam_pipeline_qr_cb_t on_decoded;
+    cam_pipeline_qr_frame_cb_t on_frame;
     void *user_ctx;
 
     k_quirc_t *qr_decoder;
@@ -238,9 +238,18 @@ static void qr_decode_task(void *pvParameters) {
 #endif
 
             int num_codes = k_quirc_count(qr->qr_decoder);
+
+            /* Per-frame outcome -- always computed (drives the unified callback),
+             * independent of the debug build. any_identified = a QR was located
+             * (finder patterns found); any_decoded = a code fully resolved. */
+            bool any_identified = (num_codes > 0);
+            bool any_decoded = false;
+            const uint8_t *out_payload = NULL;
+            size_t out_len = 0;
+            const k_quirc_data_t *out_meta = NULL;
+
 #ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
-            bool frame_decoded = false;
-            if (num_codes > 0) {
+            if (any_identified) {
                 __atomic_add_fetch(&qr->frames_identified, 1,
                                    __ATOMIC_RELAXED);
             }
@@ -276,7 +285,6 @@ static void qr_decode_task(void *pvParameters) {
                                        __ATOMIC_RELAXED);
                     __atomic_add_fetch(&qr->total_decodes, 1,
                                        __ATOMIC_RELAXED);
-                    frame_decoded = true;
                     /* Per-decode measured resolution; lets a distance sweep map
                      * decode success vs ACTUAL px/module, independent of any fill
                      * assumption. Short payload prefix carries the UR part header
@@ -291,9 +299,14 @@ static void qr_decode_task(void *pvParameters) {
                              px_per_mod, qr_result.data.payload_len,
                              (const char *)qr_result.data.payload);
 #endif
-                    qr->on_decoded(qr_result.data.payload,
-                                   qr_result.data.payload_len,
-                                   &qr_result.data, qr->user_ctx);
+                    /* First decoded code wins; one decode per frame is enough for
+                     * scanning. qr_result is function-scope, so these pointers
+                     * stay valid until the callback fires after the loop. */
+                    any_decoded = true;
+                    out_payload = qr_result.data.payload;
+                    out_len = qr_result.data.payload_len;
+                    out_meta = &qr_result.data;
+                    break;
                 }
 #ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
                 else {
@@ -308,8 +321,19 @@ static void qr_decode_task(void *pvParameters) {
 #endif
             }
 
+            /* One unified per-frame outcome callback -- fired every processed
+             * frame, including NOTHING, so a consumer can drop its indicator
+             * when the QR leaves view. The consumer dedups; the engine never
+             * suppresses (NEW vs REPEAT is a consumer-side distinction it cannot
+             * see). payload/meta are valid only when DECODED. */
+            cam_pipeline_qr_outcome_t outcome =
+                any_decoded     ? CAM_QR_DECODED
+                : any_identified ? CAM_QR_MISS
+                                 : CAM_QR_NOTHING;
+            qr->on_frame(outcome, out_payload, out_len, out_meta, qr->user_ctx);
+
 #ifdef CONFIG_CAM_PIPELINE_QR_DEBUG
-            if (frame_decoded) {
+            if (any_decoded) {
                 __atomic_add_fetch(&qr->frames_decoded, 1, __ATOMIC_RELAXED);
             }
             __atomic_add_fetch(&qr->consumer_frames, 1, __ATOMIC_RELAXED);
@@ -335,7 +359,7 @@ static void qr_decode_task(void *pvParameters) {
 
 cam_pipeline_qr_handle_t
 cam_pipeline_qr_create(const cam_pipeline_qr_config_t *config) {
-    if (!config || !config->pipeline || !config->on_decoded) {
+    if (!config || !config->pipeline || !config->on_frame) {
         ESP_LOGE(TAG, "Invalid config: pipeline and callback required");
         return NULL;
     }
@@ -349,7 +373,7 @@ cam_pipeline_qr_create(const cam_pipeline_qr_config_t *config) {
     qr->pipeline = config->pipeline;
     qr->frame_width = config->frame_width;
     qr->frame_height = config->frame_height;
-    qr->on_decoded = config->on_decoded;
+    qr->on_frame = config->on_frame;
     qr->user_ctx = config->user_ctx;
 
     /* Compute centered square crop (use shorter dimension) */
